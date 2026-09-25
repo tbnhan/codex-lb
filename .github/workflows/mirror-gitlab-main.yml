@@ -1,0 +1,98 @@
+name: Mirror main to GitLab
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs: {}
+
+permissions: {}
+
+concurrency:
+  group: codex-lb-gitlab-main-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'tbnhan/codex-lb' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: gitlab-main-mirror
+    steps:
+      - name: Sync main safely
+        shell: bash
+        env:
+          GITLAB_SYNC_SSH_KEY: ${{ secrets.GITLAB_SYNC_SSH_KEY }}
+          SOURCE_URL: https://github.com/tbnhan/codex-lb.git
+          TARGET_URL: git@gitlab.com:A.L.V.I.S/codex-lb.git
+          SOURCE_REF: refs/heads/main
+          TARGET_REF: refs/heads/main
+          GITLAB_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAfuCHKVTjquxvt6CM6tdG4SLp1Btn/nOeHHE5UOzRdf
+        run: |
+          set -euo pipefail
+          umask 077
+          temp_dir="$(mktemp -d)"
+          agent_started=0
+          cleanup() {
+            if [[ "$agent_started" == 1 ]]; then
+              ssh-agent -k >/dev/null 2>&1 || true
+            fi
+            rm -rf "$temp_dir"
+          }
+          trap cleanup EXIT
+
+          if [[ -z "${GITLAB_SYNC_SSH_KEY:-}" ]]; then
+            echo "GITLAB_SYNC_SSH_KEY is required" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REPOSITORY" != "tbnhan/codex-lb" || "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Workflow is restricted to tbnhan/codex-lb main" >&2
+            exit 1
+          fi
+
+          eval "$(ssh-agent -s)" >/dev/null
+          agent_started=1
+          printf '%s\n' "$GITLAB_SYNC_SSH_KEY" | ssh-add - >/dev/null
+          unset GITLAB_SYNC_SSH_KEY
+          mkdir -p "$temp_dir/ssh"
+          chmod 700 "$temp_dir/ssh"
+          printf 'gitlab.com %s\n' "$GITLAB_HOST_KEY" > "$temp_dir/ssh/known_hosts"
+          chmod 600 "$temp_dir/ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -F /dev/null -o IdentityFile=none -o IdentitiesOnly=no -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$temp_dir/ssh/known_hosts -o IdentityAgent=$SSH_AUTH_SOCK"
+
+          git init --quiet "$temp_dir/repo"
+          cd "$temp_dir/repo"
+          git remote add source "$SOURCE_URL"
+          git remote add target "$TARGET_URL"
+          git fetch --quiet --no-tags source "$SOURCE_REF"
+          source_sha="$(git rev-parse FETCH_HEAD)"
+          git update-ref refs/remotes/source/main "$source_sha"
+
+          if ! git fetch --quiet --no-tags target "$TARGET_REF"; then
+            echo "Target main is missing or cannot be fetched" >&2
+            exit 1
+          fi
+          target_sha="$(git rev-parse FETCH_HEAD)"
+          git update-ref refs/remotes/target/main "$target_sha"
+
+          if [[ "$source_sha" == "$target_sha" ]]; then
+            result="already up to date"
+          elif git merge-base --is-ancestor "$target_sha" "$source_sha"; then
+            git push --porcelain target "$source_sha:$TARGET_REF"
+            result="updated"
+          else
+            echo "Refusing non-fast-forward mirror: target main is ahead or diverged" >&2
+            exit 1
+          fi
+
+          git fetch --quiet --no-tags target "$TARGET_REF"
+          verified_sha="$(git rev-parse FETCH_HEAD)"
+          if [[ "$verified_sha" != "$source_sha" ]]; then
+            echo "Target main changed during sync; post-push SHA does not match source" >&2
+            exit 1
+          fi
+          {
+            printf 'Result: %s\n' "$result"
+            printf 'Source SHA: `%s`\n' "$source_sha"
+            printf 'Target SHA: `%s`\n' "$verified_sha"
+          } >> "$GITHUB_STEP_SUMMARY"
